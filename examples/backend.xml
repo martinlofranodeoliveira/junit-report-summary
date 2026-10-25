@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="3">
+  <testsuite name="synthetic-api" tests="3" time="0.6">
+    <testcase classname="Health" name="ready" time="0.1"/>
+    <testcase classname="Retry" name="recovers after temporary failure" time="0.2">
+      <failure message="Synthetic failure for the demo">This text is omitted from output.</failure>
+    </testcase>
+    <testcase classname="Optional" name="feature unavailable" time="0.3"><skipped/></testcase>
+  </testsuite>
+</testsuites>
