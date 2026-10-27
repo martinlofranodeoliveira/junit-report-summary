@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="service">
+  <testsuite name="auth">
+    <testcase classname="Auth" name="test_login[user]" time="0.1" />
+    <testcase classname="Auth" name="test_expired_token" time="0.2">
+      <failure message="Synthetic failure">Synthetic diagnostic; excluded from summaries.</failure>
+    </testcase>
+    <testcase classname="Health" name="test_health" time="0.01" />
+    <testcase classname="Optional" name="test_optional" time="0">
+      <skipped />
+    </testcase>
+  </testsuite>
+</testsuite>

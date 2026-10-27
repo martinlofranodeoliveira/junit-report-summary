@@ -160,6 +160,67 @@ def combine_reports(reports: list[dict]) -> dict:
         raise ReportError("Invalid JUnit report.") from exc
 
 
+def analyze_history(runs: list[dict]) -> dict:
+    """Describe observed outcomes across 1..100 explicitly supplied runs.
+
+    Each run is exactly {"id": str, "report": parse_report_result}. Identity is
+    the exact suite/class/name triple, independent of source. Duplicate identity
+    within a run is ambiguous and rejected; missing runs have no observation.
+    Run order is caller order, with no assumption about chronology or causes.
+    """
+    if not isinstance(runs, (list, tuple)) or not 1 <= len(runs) <= 100:
+        _bad()
+    run_ids: list[str] = []
+    seen_ids: set[str] = set()
+    tests: dict[tuple, dict] = {}
+    total_cases = 0
+    for run in runs:
+        if type(run) is not dict or set(run) != {"id", "report"}:
+            _bad()
+        run_id = run["id"]
+        if (not isinstance(run_id, str) or not 1 <= len(run_id) <= 128
+                or any(ord(char) < 32 or ord(char) == 127 for char in run_id)
+                or run_id in seen_ids):
+            _bad()
+        seen_ids.add(run_id)
+        run_ids.append(run_id)
+        # Reuse record/duration checks and copies; advisory totals are ignored.
+        report = combine_reports([run["report"]])
+        total_cases += len(report["cases"])
+        if total_cases > MAX_CASES:
+            _bad()
+        seen_cases: set[tuple] = set()
+        for case in report["cases"]:
+            identity = (tuple(case["suite"]), case["class_name"], case["name"])
+            if identity in seen_cases:
+                _bad()
+            seen_cases.add(identity)
+            if identity not in tests:
+                tests[identity] = {
+                    "identity": {"suite": list(identity[0]), "class_name": identity[1], "name": identity[2]},
+                    "classification": "",
+                    "counts": dict.fromkeys(("passed", "failure", "error", "skipped"), 0),
+                    "observations": [],
+                    "missing_runs": [],
+                }
+            test = tests[identity]
+            test["counts"][case["status"]] += 1
+            test["observations"].append({"run": run_id, "status": case["status"]})
+    summary = dict.fromkeys(("tests", "mixed", "problem_only", "pass_only", "skipped_only"), 0)
+    summary["tests"] = len(tests)
+    for test in tests.values():
+        counts = test["counts"]
+        problems = counts["failure"] + counts["error"]
+        classification = ("mixed" if counts["passed"] and problems else
+                          "problem_only" if problems else
+                          "pass_only" if counts["passed"] else "skipped_only")
+        test["classification"] = classification
+        summary[classification] += 1
+        observed = {item["run"] for item in test["observations"]}
+        test["missing_runs"] = [run_id for run_id in run_ids if run_id not in observed]
+    return {"runs": run_ids, "summary": summary, "tests": list(tests.values())}
+
+
 def _markdown_cell(value: str) -> str:
     # Neutralize HTML, table delimiters, inline syntax and hard line breaks.
     value = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -177,6 +238,34 @@ def format_markdown(report: dict) -> str:
     for case in report["cases"]:
         cells = (case["source"], " / ".join(case["suite"]), case["class_name"], case["name"], case["status"], case["duration_seconds"])
         lines.append("| " + " | ".join(_markdown_cell(x) for x in cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def format_history_markdown(history: dict) -> str:
+    """Render observed history with escaped identifiers and deterministic tables."""
+    summary = history["summary"]
+    fields = ("tests", "mixed", "problem_only", "pass_only", "skipped_only")
+    lines = ["# JUnit observed outcome history", "",
+             ", ".join(f"{key}: {summary[key]}" for key in fields), "",
+             "Run order is supplied order. Missing runs have no observation.", "",
+             "| Run |", "| --- |"]
+    for run_id in history["runs"]:
+        lines.append("| " + _markdown_cell(run_id) + " |")
+    lines.extend(["", "| Suite | Class | Test | Classification | Passed | Failures | Errors | Skipped | Missing runs |",
+                  "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- |"])
+    for test in history["tests"]:
+        identity, counts = test["identity"], test["counts"]
+        cells = (" / ".join(identity["suite"]), identity["class_name"], identity["name"],
+                 test["classification"], *(str(counts[key]) for key in ("passed", "failure", "error", "skipped")),
+                 ", ".join(test["missing_runs"]))
+        lines.append("| " + " | ".join(_markdown_cell(value) for value in cells) + " |")
+    lines.extend(["", "| Suite | Class | Test | Run | Outcome |", "| --- | --- | --- | --- | --- |"])
+    for test in history["tests"]:
+        identity = test["identity"]
+        for observation in test["observations"]:
+            cells = (" / ".join(identity["suite"]), identity["class_name"], identity["name"],
+                     observation["run"], observation["status"])
+            lines.append("| " + " | ".join(_markdown_cell(value) for value in cells) + " |")
     return "\n".join(lines) + "\n"
 
 
@@ -200,9 +289,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Summarize explicit local UTF-8 JUnit XML files offline.")
     parser.add_argument("files", nargs="+", metavar="FILE")
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
+    parser.add_argument("--history", action="store_true", help="compare observed outcomes with each FILE as a separate run")
     parser.add_argument("--fail-on-problems", action="store_true", help="exit 1 if cases contain failures or errors")
     args = parser.parse_args(argv)
     try:
+        if args.history and len(args.files) > 100:
+            _bad()
         parsed = []
         total_cases = 0
         for path in args.files:
@@ -211,8 +303,15 @@ def main(argv: list[str] | None = None) -> int:
             if total_cases > MAX_CASES:
                 _bad()
             parsed.append(item)
-        report = combine_reports(parsed)
-        output = format_markdown(report) if args.format == "markdown" else json.dumps(report, ensure_ascii=True, indent=2) + "\n"
+        if args.history:
+            report = analyze_history([{"id": path, "report": item} for path, item in zip(args.files, parsed)])
+            problems = report["summary"]["mixed"] or report["summary"]["problem_only"]
+            formatter = format_history_markdown
+        else:
+            report = combine_reports(parsed)
+            problems = report["summary"]["failures"] or report["summary"]["errors"]
+            formatter = format_markdown
+        output = formatter(report) if args.format == "markdown" else json.dumps(report, ensure_ascii=True, indent=2) + "\n"
     except (ReportError, OSError):
         print("Unable to summarize JUnit report inputs.", file=sys.stderr)
         return 2
@@ -220,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(output)
     except (BrokenPipeError, UnicodeError):
         return 2
-    return 1 if args.fail_on_problems and (report["summary"]["failures"] or report["summary"]["errors"]) else 0
+    return 1 if args.fail_on_problems and problems else 0
 
 
 if __name__ == "__main__":
